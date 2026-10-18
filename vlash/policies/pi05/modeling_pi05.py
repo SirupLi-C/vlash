@@ -32,6 +32,7 @@ Architecture:
 import builtins
 import math
 import os
+import logging
 from collections import deque
 from pathlib import Path
 
@@ -598,7 +599,14 @@ class PI05Model(nn.Module):
         # Optional torch.compile for faster inference
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+            # CUDA Graphs (cudagraph trees): 消除 kernel launch 开销，需固定输入形状。
+            # torch.compile 不允许同时传 mode 和 options，故直接设置 inductor 全局配置
+            if config.cuda_graphs:
+                import torch._inductor.config as inductor_config
+                inductor_config.triton.cudagraphs = True
+            if not getattr(config, "compile_full_inference", False):
+                # 全路径编译模式下，由 PI05Policy 在外层编译整条推理路径（含预处理/后处理）
+                self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
     def init_qkv_fusion_from_existing(self) -> None:
         """Fuse Q/K/V projections into single QKVLinear for faster inference.
@@ -1153,8 +1161,35 @@ class PI05Policy(PreTrainedPolicy):
         )
 
         # Initialize tokenizer and model
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        # 本地 tokenizer 优先（google/paligemma-3b-pt-224 为 gated 仓库，审核期间无法下载）
+        _paligemma_local = "/root/autodl-tmp/paligemma-3b-pt-224"
+        _tokenizer_src = _paligemma_local if Path(_paligemma_local).exists() else "google/paligemma-3b-pt-224"
+        self.language_tokenizer = AutoTokenizer.from_pretrained(_tokenizer_src)
         self.model = PI05Model(config)
+
+        # 全路径编译：把 normalize → 图像预处理 → state padding → 采样 → 反归一化
+        # 整条 GPU 路径编译进一张图（tokenize 是 CPU 操作，留在编译边界外）。
+        # state_cond=False 时 tokenize 依赖归一化后的 state（含 .cpu() 同步），
+        # 无法移出 normalize 之后，故不支持，回退到仅编译 sample_actions。
+        self._full_inference_compiled = bool(
+            config.compile_model
+            and getattr(config, "compile_full_inference", False)
+            and config.state_cond
+        )
+        if (
+            config.compile_model
+            and getattr(config, "compile_full_inference", False)
+            and not config.state_cond
+        ):
+            logging.warning(
+                "compile_full_inference requires state_cond=True; "
+                "falling back to model-only compile"
+            )
+        self._predict_chunk_fn = self._predict_chunk_gpu
+        if self._full_inference_compiled:
+            self._predict_chunk_fn = torch.compile(
+                self._predict_chunk_gpu, mode=config.compile_mode
+            )
 
         self.reset()
 
@@ -1291,20 +1326,56 @@ class PI05Policy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions for inference.
-        
+
         Args:
             batch: Input batch with images, state, task.
             noise: Optional noise for deterministic sampling.
-            
+
         Returns:
             Action chunk [B, n_action_steps, action_dim].
         """
-        batch = self.normalize_inputs(batch)
+        if not self._full_inference_compiled:
+            # 默认路径（行为与历史版本一致）
+            batch = self.normalize_inputs(batch)
 
-        images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
+            images, img_masks = self.prepare_images(batch)
+            state = self.prepare_state(batch)
 
+            lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
+
+            actions = self.model.sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise
+            )
+
+            # Trim to original action dimension
+            original_action_dim = self.config.action_feature.shape[0]
+            actions = actions[:, :, :original_action_dim]
+
+            actions = self.unnormalize_outputs({"action": actions})["action"]
+
+            return actions[:, : self.config.n_action_steps, :]
+
+        # 全路径编译：tokenize（CPU）在图外，其余 GPU 操作合并为单图
         lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
+        obs_batch = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        return self._predict_chunk_fn(obs_batch, lang_tokens, lang_masks, noise=noise)
+
+    def _predict_chunk_gpu(
+        self,
+        obs_batch: dict[str, Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        """GPU-only 推理路径（compile_full_inference 的编译单元）。
+
+        与默认路径操作顺序完全一致，仅将 tokenize 移到边界外（state_cond=True 时
+        token 只依赖任务文本，数值不变）。
+        """
+        obs_batch = self.normalize_inputs(obs_batch)
+
+        images, img_masks = self.prepare_images(obs_batch)
+        state = self.prepare_state(obs_batch)
 
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise

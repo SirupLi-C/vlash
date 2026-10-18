@@ -146,6 +146,11 @@ class PI05Config(PreTrainedConfig):
     gradient_checkpointing: bool = False  # Trade compute for memory
     compile_model: bool = False  # Use torch.compile optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
+    cuda_graphs: bool = False  # Enable CUDA Graphs (inductor cudagraph trees) to eliminate kernel launch overhead
+    # Compile the full inference path (normalize + image prep + state padding + sampling +
+    # unnormalize) into one graph instead of only sample_actions. Tokenization (CPU) stays
+    # outside the compiled boundary. Requires state_cond=True.
+    compile_full_inference: bool = False
     device: str | None = None  # Target device (None = auto-detect)
 
     # Attention/MLP fusion (for inference optimization)

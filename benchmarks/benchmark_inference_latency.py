@@ -200,6 +200,8 @@ def benchmark_inference_latency_impl(
         "p95_ms": float(np.percentile(latencies, 95)),
         "p99_ms": float(np.percentile(latencies, 99)),
         "fps": float(1000.0 / np.mean(latencies)),
+        # 逐样本原始延迟（ms），便于事后剔除编译等污染样本重新统计
+        "latencies_ms": [round(float(x), 3) for x in latencies],
     }
     
     return results
@@ -237,17 +239,19 @@ def print_results(results: dict, cfg: BenchmarkConfig):
 
 def save_results(results: dict, cfg: BenchmarkConfig):
     """Save benchmark results to JSON file.
-    
-    Includes both configuration and results for reproducibility.
-    
+
+    Includes both configuration and results (with per-sample latencies)
+    for reproducibility. Results are always saved: when ``output_file``
+    is not configured, they default to ``{output_dir}/inference_latency_results.json``.
+
     Args:
         results: Benchmark results.
         cfg: Configuration used for benchmark.
     """
     if cfg.output_file is None:
-        return
-    
-    output_path = Path(cfg.output_file)
+        output_path = Path(cfg.output_dir) / "inference_latency_results.json"
+    else:
+        output_path = Path(cfg.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     pretrained_path = getattr(cfg.policy, 'pretrained_path', None)

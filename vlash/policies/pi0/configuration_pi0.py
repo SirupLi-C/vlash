@@ -130,6 +130,7 @@ class PI0Config(PreTrainedConfig):
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
+    cuda_graphs: bool = False  # Enable CUDA Graphs (inductor cudagraph trees) to eliminate kernel launch overhead
     device: str | None = None
 
     # Attention/MLP fusion (disable for LoRA fine-tuning)

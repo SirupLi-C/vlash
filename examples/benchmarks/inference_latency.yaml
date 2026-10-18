@@ -9,10 +9,25 @@ policy:
   type: pi05
   device: cuda
   dtype: bfloat16
-  
+
+  # 对齐论文 Table II 设置: pi0.5, 1 image input, K=25 @ 50Hz
+  # (仓库默认 chunk_size=50/n_action_steps=50, 论文为 K=25)
+  chunk_size: 25
+  n_action_steps: 25
+
+  # state 走 adaRMS 条件而非离散化拼进 prompt (论文部署设置, async.yaml 同款)。
+  # cuda_graphs 需要静态 token 形状: state_cond=false 时 token 长度随 state 值变化,
+  # 会导致 CUDA Graph 失效
+  state_cond: true
+
   # Enable torch.compile for optimized inference
   compile_model: true
-  
+
+  # Enable CUDA Graphs to eliminate kernel launch overhead
+  # (对齐论文 Table II: "enabling CUDA Graphs and kernel fusion optimization")
+  cuda_graphs: true
+  compile_full_inference: true
+
   # Enable attention/MLP fusion for faster inference
   fuse_qkv: true
   fuse_gate_up: true

@@ -412,6 +412,11 @@ class PI0Model(nn.Module):
 
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
+            # CUDA Graphs (cudagraph trees): 消除 kernel launch 开销，需固定输入形状。
+            # torch.compile 不允许同时传 mode 和 options，故直接设置 inductor 全局配置
+            if config.cuda_graphs:
+                import torch._inductor.config as inductor_config
+                inductor_config.triton.cudagraphs = True
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
     def init_qkv_fusion_from_existing(self) -> None:
@@ -883,7 +888,10 @@ class PI0Policy(PreTrainedPolicy):
             stats=dataset_stats,
         )
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        # 本地 tokenizer 优先（google/paligemma-3b-pt-224 为 gated 仓库，审核期间无法下载）
+        _paligemma_local = "/root/autodl-tmp/paligemma-3b-pt-224"
+        _tokenizer_src = _paligemma_local if Path(_paligemma_local).exists() else "google/paligemma-3b-pt-224"
+        self.language_tokenizer = AutoTokenizer.from_pretrained(_tokenizer_src)
         self.model = PI0Model(config)
 
         self.reset()
